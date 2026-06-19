@@ -1,0 +1,149 @@
+# Runs on every push to main (triggered by Lovable syncs and direct commits).
+# Checks which files changed and flags high-risk areas: supabase/, src/services/,
+# src/lib/, src/hooks/, .env files, and filenames containing auth/secret/token/credential.
+# If high-risk files are found, it sends the diff to Claude for a security review.
+# A GitHub Issue is only created if Claude rates the risk as Medium or High (Low = no issue).
+# Read-only — creates issues only; it does not block pushes or modify any code.
+name: Lovable Push Security Monitor
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  monitor-lovable-push:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Check changed files
+        id: changed-files
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const before = context.payload.before;
+            const after = context.payload.after;
+
+            const comparison = await github.rest.repos.compareCommits({
+              owner,
+              repo,
+              base: before,
+              head: after
+            });
+
+            const changedFiles = comparison.data.files.map(file => file.filename);
+
+            // Tighter patterns that trigger both Claude review and issue creation.
+            // src/components/ and src/pages/ removed — Lovable touches these on every
+            // push, which would create an issue for every single change with no review.
+            const highRiskPatterns = [
+              /^supabase\//,
+              /^src\/services\//,
+              /^src\/lib\//,
+              /^src\/hooks\//,
+              /^\.env/,
+              /auth/i,
+              /secret/i,
+              /token/i,
+              /credential/i
+            ];
+
+            const highRiskFiles = changedFiles.filter(file =>
+              highRiskPatterns.some(pattern => pattern.test(file))
+            );
+
+            core.setOutput("changed_files", changedFiles.join("\n"));
+            core.setOutput("high_risk_files", highRiskFiles.join("\n"));
+            core.setOutput("has_high_risk_files", highRiskFiles.length > 0 ? "true" : "false");
+
+      - name: Get diff for Claude review
+        id: get-diff
+        if: steps.changed-files.outputs.has_high_risk_files == 'true'
+        run: |
+          FILES=$(echo "${{ steps.changed-files.outputs.high_risk_files }}" | tr '\n' ' ')
+          git diff HEAD~1 HEAD -- $FILES | head -c 10000 > /tmp/security_diff.txt
+
+      - name: Run Claude security review
+        id: claude-review
+        if: steps.changed-files.outputs.has_high_risk_files == 'true'
+        run: |
+          HIGH_RISK_FILES="${{ steps.changed-files.outputs.high_risk_files }}"
+          DIFF=$(cat /tmp/security_diff.txt)
+
+          # Write payload to file to avoid JSON injection from diff content
+          jq -n \
+            --arg files "$HIGH_RISK_FILES" \
+            --arg diff "$DIFF" \
+            '{
+              model: "claude-sonnet-4-6",
+              max_tokens: 2048,
+              messages: [{
+                role: "user",
+                content: ("Review this code diff for security concerns.\n\nHigh-risk files changed:\n" + $files + "\n\nDiff:\n" + $diff + "\n\nRespond with:\n1. Overall risk level: Low, Medium, or High\n2. Summary of findings\n3. Specific files or areas of concern\n4. Recommended next steps\n5. If Medium or High risk, include a copy/paste-ready Lovable prompt to address the issue\n6. State clearly whether IT manual review is recommended before the next deployment\n\nDo not modify files. Do not commit changes.")
+              }]
+            }' > /tmp/claude_payload.json
+
+          RESPONSE=$(curl -s https://api.anthropic.com/v1/messages \
+            -H "x-api-key: ${{ secrets.ANTHROPIC_API_KEY }}" \
+            -H "anthropic-version: 2023-06-01" \
+            -H "content-type: application/json" \
+            --data @/tmp/claude_payload.json)
+
+          REVIEW=$(echo "$RESPONSE" | jq -r '.content[0].text')
+          echo "response<<EOF" >> $GITHUB_OUTPUT
+          echo "$REVIEW" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+          # Extract risk level from Claude's response (first line containing Low/Medium/High)
+          RISK_LEVEL=$(echo "$REVIEW" | grep -oiE '\b(Low|Medium|High)\b' | head -1 | tr '[:lower:]' '[:upper:]')
+          echo "risk_level=$RISK_LEVEL" >> $GITHUB_OUTPUT
+
+      - name: Create security review issue
+        if: >
+          steps.changed-files.outputs.has_high_risk_files == 'true' &&
+          (steps.claude-review.outputs.risk_level == 'MEDIUM' ||
+           steps.claude-review.outputs.risk_level == 'HIGH' ||
+           steps.claude-review.outputs.risk_level == '')
+        uses: actions/github-script@v7
+        env:
+          CLAUDE_REVIEW: ${{ steps.claude-review.outputs.response }}
+          HIGH_RISK_FILES: ${{ steps.changed-files.outputs.high_risk_files }}
+          CHANGED_FILES: ${{ steps.changed-files.outputs.changed_files }}
+        with:
+          script: |
+            const highRiskFiles = process.env.HIGH_RISK_FILES;
+            const changedFiles = process.env.CHANGED_FILES;
+            const commitUrl = context.payload.compare;
+            const claudeReview = process.env.CLAUDE_REVIEW;
+
+            const issueBody = `
+            A Lovable/GitHub sync pushed changes directly to \`main\`.
+
+            ## Claude Security Review
+            ${claudeReview || 'Claude review did not produce output. Manual review recommended.'}
+
+            ## High-risk files changed
+            ${highRiskFiles}
+
+            ## All changed files
+            ${changedFiles}
+
+            ## Compare changes
+            ${commitUrl}
+            `;
+
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Security review needed for Lovable sync`,
+              body: issueBody,
+              labels: ["security-review"]
+            });

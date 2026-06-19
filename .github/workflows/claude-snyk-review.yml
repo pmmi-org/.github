@@ -1,0 +1,35 @@
+# Runs when Snyk opens an automated dependency-update PR (branch name starts with "snyk-").
+# Sends the PR diff to Claude, which posts a comment with a SAFE TO MERGE / HOLD verdict,
+# a plain-English summary of what changed, and a one-line recommendation.
+# Read-only — Claude comments only; it does not merge or modify any code.
+name: Claude Snyk PR Review
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  claude-review:
+    if: startsWith(github.head_ref, 'snyk-')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Claude Snyk PR Analysis
+        uses: anthropics/claude-code-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            A Snyk security PR has been opened. Analyze it and post a comment with:
+
+            1. **Verdict**: SAFE TO MERGE or HOLD — one line at the top
+            2. **What's changing**: package name, old version → new version
+            3. **Risk assessment**: Is this a patch, minor, or major version bump? Any breaking changes?
+            4. **Recommendation**: merge, ignore, or needs manual review — one sentence why
+
+            Keep the comment short and practical. Do not merge the PR yourself.
